@@ -1,0 +1,117 @@
+name: Deploy and verify Omok
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: omok-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      build_type: ${{ steps.site.outputs.build_type }}
+      site_url: ${{ steps.site.outputs.site_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read actual Pages configuration
+        id: site
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/pages" > "$RUNNER_TEMP/pages.json"
+          jq '{status, build_type, source, html_url}' "$RUNNER_TEMP/pages.json"
+          build_type=$(jq -r '.build_type' "$RUNNER_TEMP/pages.json")
+          site_url=$(jq -r '.html_url' "$RUNNER_TEMP/pages.json")
+          case "$build_type" in
+            workflow|legacy) ;;
+            *) echo '::error::Unsupported Pages publishing source'; exit 1 ;;
+          esac
+          if [ "$build_type" = legacy ]; then
+            jq -e '.source.branch == "main" and .source.path == "/"' "$RUNNER_TEMP/pages.json" >/dev/null || {
+              echo '::error::Branch publishing must use main and /(root), where index.html exists.'
+              exit 1
+            }
+          fi
+          echo "build_type=$build_type" >> "$GITHUB_OUTPUT"
+          echo "site_url=$site_url" >> "$GITHUB_OUTPUT"
+      - name: Prepare only the game files
+        run: |
+          test -s index.html
+          mkdir -p _site
+          cp index.html _site/index.html
+          touch _site/.nojekyll
+      - name: Upload Pages artifact
+        if: steps.site.outputs.build_type == 'workflow'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.build_type == 'workflow'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - name: Wait until the uploaded artifact is visible
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 12); do
+            count=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" --jq '[.artifacts[] | select(.name == "github-pages" and .expired == false)] | length')
+            echo "Artifact readiness attempt $attempt: $count artifact(s)"
+            if [ "$count" -ge 1 ]; then
+              sleep 10
+              exit 0
+            fi
+            sleep 5
+          done
+          echo '::error::Uploaded Pages artifact did not become visible.'
+          exit 1
+      - name: Publish game
+        id: publish
+        uses: actions/deploy-pages@v4
+
+  verify:
+    needs: [build, deploy]
+    if: always() && needs.build.result == 'success' && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    permissions:
+      contents: read
+    steps:
+      - name: Verify the public game URL, not only the upload
+        env:
+          SITE_URL: ${{ needs.build.outputs.site_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 24); do
+            status=$(curl -L -sS --connect-timeout 10 --max-time 20 -H 'Cache-Control: no-cache' -o "$RUNNER_TEMP/omok-live.html" -w '%{http_code}' "${SITE_URL}?verify=${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}" || true)
+            echo "Live-site check $attempt: HTTP $status at $SITE_URL"
+            if [ "$status" = 200 ] && grep -q 'id="board"' "$RUNNER_TEMP/omok-live.html" && grep -q '컴퓨터와 대전' "$RUNNER_TEMP/omok-live.html"; then
+              echo "VERIFIED: HTTP 200 and Omok game content at $SITE_URL"
+              printf '## Live verification passed\n\n%s\n\nHTTP 200; game board and computer mode are present.\n' "$SITE_URL" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo '::error::The public URL is not serving the Omok game. Deployment is not verified.'
+          exit 1
